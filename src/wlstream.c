@@ -429,68 +429,72 @@ void *video_encode_thread(void *arg)
 	int err = 0;
 	struct capture_context *ctx = arg;
 
-	do {
-		AVFrame *f = NULL;
-		if (get_fifo_size(&ctx->video_frames) || !atomic_load(&ctx->quit))
-			f = pop_from_fifo(&ctx->video_frames);
+        do {
+            AVFrame* f = NULL;
+            if (get_fifo_size(&ctx->video_frames))
+                f = pop_from_fifo(&ctx->video_frames);
 
-		if (ctx->is_software_encoder && f) {
-			AVFrame *soft_frame = av_frame_alloc();
-			av_hwframe_transfer_data(soft_frame, f, 0);
-			soft_frame->pts = f->pts;
-			av_frame_free(&f);
-			f = soft_frame;
-		}
-
-        if (f)
-            f->pts = av_rescale_q(f->pts, ctx->video_src_tb,
-                                  ctx->video_avctx->time_base);
-
-		err = avcodec_send_frame(ctx->video_avctx, f);
-
-		av_frame_free(&f);
-
-		if (err) {
-			av_log(ctx, AV_LOG_ERROR, "Error encoding: %s!\n", av_err2str(err));
-			goto end;
-		}
-
-		while (1) {
-			AVPacket pkt;
-			av_init_packet(&pkt);
-
-			int ret = avcodec_receive_packet(ctx->video_avctx, &pkt);
-			if (ret == AVERROR(EAGAIN)) {
-				break;
-			} else if (ret == AVERROR_EOF) {
-				av_log(ctx, AV_LOG_INFO, "Encoder flushed (video)!\n");
-				goto end;
-			} else if (ret) {
-				av_log(ctx, AV_LOG_ERROR, "Error encoding: %s!\n",
-						av_err2str(ret));
-				err = ret;
-				goto end;
+            if (ctx->is_software_encoder && f) {
+                AVFrame* soft_frame = av_frame_alloc();
+                av_hwframe_transfer_data(soft_frame, f, 0);
+                soft_frame->pts = f->pts;
+                av_frame_free(&f);
+                f = soft_frame;
             }
 
-            pkt.stream_index = ctx->video_streamid;
+            if (f) {
+                f->pts = av_rescale_q(
+                    f->pts, ctx->video_src_tb, ctx->video_avctx->time_base);
 
-            pthread_mutex_lock(&ctx->avf_lock);
-            err = av_interleaved_write_frame(ctx->avf, &pkt);
-            pthread_mutex_unlock(&ctx->avf_lock);
+                err = avcodec_send_frame(ctx->video_avctx, f);
 
-            av_packet_unref(&pkt);
+                av_frame_free(&f);
 
-            if (err) {
-                av_log(ctx, AV_LOG_ERROR, "Writing video packet fail: %s!\n",
-                       av_err2str(err));
-                goto end;
+                if (err) {
+                    av_log(ctx, AV_LOG_ERROR, "Error encoding: %s!\n",
+                        av_err2str(err));
+                    goto end;
+                }
+
+                while (1) {
+                    AVPacket pkt;
+                    av_init_packet(&pkt);
+
+                    int ret = avcodec_receive_packet(ctx->video_avctx, &pkt);
+                    if (ret == AVERROR(EAGAIN)) {
+                        break;
+                    } else if (ret == AVERROR_EOF) {
+                        av_log(ctx, AV_LOG_INFO, "Encoder flushed (video)!\n");
+                        goto end;
+                    } else if (ret) {
+                        av_log(ctx, AV_LOG_ERROR, "Error encoding: %s!\n",
+                            av_err2str(ret));
+                        err = ret;
+                        goto end;
+                    }
+
+                    pkt.stream_index = ctx->video_streamid;
+
+                    pthread_mutex_lock(&ctx->avf_lock);
+                    err = av_interleaved_write_frame(ctx->avf, &pkt);
+                    pthread_mutex_unlock(&ctx->avf_lock);
+
+                    av_packet_unref(&pkt);
+
+                    if (err) {
+                        av_log(ctx, AV_LOG_ERROR,
+                            "Writing video packet fail: %s!\n",
+                            av_err2str(err));
+                        goto end;
+                    }
+                };
+
+                av_log(ctx, AV_LOG_INFO,
+                    "Encoded video frame %i (%i in queue)\n",
+                    ctx->video_avctx->frame_number,
+                    get_fifo_size(&ctx->video_frames));
             }
-        };
-
-		av_log(ctx, AV_LOG_INFO, "Encoded video frame %i (%i in queue)\n",
-				ctx->video_avctx->frame_number, get_fifo_size(&ctx->video_frames));
-
-	} while (!ctx->err);
+        } while (!ctx->err && !atomic_load(&ctx->quit));
 
 end:
     if (!ctx->err && err)
@@ -781,7 +785,7 @@ void *audio_encode_thread(void *arg)
         AVFrame *in_f = NULL;
         os = swr_get_out_samples(ctx->swr_ctx, 0);
         if (!(os > ctx->audio_avctx->frame_size) &&
-            (get_fifo_size(&ctx->audio_frames) || !atomic_load(&ctx->quit))) {
+            (get_fifo_size(&ctx->audio_frames))) {
             in_f = pop_from_fifo(&ctx->audio_frames);
             if (!frames_consumed++)
                 first_pts = in_f->pts;
@@ -862,7 +866,7 @@ void *audio_encode_thread(void *arg)
 
 	    frames_consumed = 0;
 	    first_pts = INT64_MIN;
-    } while (!ctx->err);
+    } while (!ctx->err && !atomic_load(&ctx->quit));
 
 end:
     if (!ctx->err && err)
